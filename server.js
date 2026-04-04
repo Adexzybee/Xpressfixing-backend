@@ -5,12 +5,13 @@ const cors = require('cors');
 const { MongoClient } = require('mongodb');
 const bcrypt = require('bcrypt');
 const rateLimit = require('express-rate-limit');
+const jwt = require('jsonwebtoken');
 
 const app = express();
-const PORT = process.env.PORT || 3000;  // ✅ ONLY ONE DECLARATION
+const PORT = process.env.PORT || 3000;
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017';
 const DB_NAME = process.env.DB_NAME || 'xpressfixing';
-const API_KEY = process.env.API_KEY;
+const JWT_SECRET = process.env.JWT_SECRET || 'xpressfixing_temp_secret_change_in_production';
 
 // ========== MIDDLEWARE ==========
 
@@ -40,42 +41,25 @@ const limiter = rateLimit({
 });
 app.use(limiter);
 
-// ========== AUTHENTICATION ==========
-if (API_KEY) {
-  app.use((req, res, next) => {
-    if (req.method === 'OPTIONS') {
-      return next();
-    }
-    const key = req.headers['x-api-key'];
-    if (!key || key !== API_KEY) {
-      return res.status(403).json({ error: 'Invalid or missing API key' });
-    }
-    next();
-  });
-  console.log('🔒 API Key protection: ENABLED');
-} else {
-  console.log('🔓 API Key protection: DISABLED');
-}
-
-// User context middleware
-app.use(async (req, res, next) => {
-  if (req.headers['x-test-user'] && process.env.NODE_ENV !== 'production') {
-    req.user = {
-      id: parseInt(req.headers['x-test-user']),
-      role: req.headers['x-test-role'] || 'customer'
-    };
-    return next();
+// ========== JWT AUTHENTICATION MIDDLEWARE ==========
+function authenticateToken(req, res, next) {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1]; // Bearer TOKEN
+  
+  if (!token) {
+    return res.status(401).json({ error: 'Access token required' });
   }
   
-  req.user = {
-    id: 2,
-    role: 'customer'
-  };
-  
-  next();
-});
+  jwt.verify(token, JWT_SECRET, (err, user) => {
+    if (err) {
+      return res.status(403).json({ error: 'Invalid or expired token' });
+    }
+    req.user = user;
+    next();
+  });
+}
 
-// ========== AUTHORIZATION MIDDLEWARE ==========
+// Optional: Admin-only middleware
 function requireAdmin(req, res, next) {
   if (!req.user || req.user.role !== 'admin') {
     return res.status(403).json({ 
@@ -186,7 +170,8 @@ async function startServer() {
     
     console.log('✅ Database collections ready');
     
-    // ========== AUTHENTICATION ROUTES ==========
+    // ========== PUBLIC ROUTES (No authentication required) ==========
+    
     app.post('/api/auth/login', async (req, res) => {
       const { email, password } = req.body;
       
@@ -204,8 +189,21 @@ async function startServer() {
         return res.status(401).json({ error: 'Invalid email or password' });
       }
       
+      // Create JWT token
+      const token = jwt.sign(
+        { 
+          id: user.id, 
+          email: user.email, 
+          role: user.role,
+          status: user.status 
+        }, 
+        JWT_SECRET, 
+        { expiresIn: '7d' }
+      );
+      
       res.json({
         success: true,
+        token: token,
         user: {
           id: user.id,
           name: user.name,
@@ -314,14 +312,29 @@ async function startServer() {
       });
     });
     
+    // Health check
+    app.get('/health', (req, res) => {
+      res.json({ status: 'OK', message: 'Xpressfixing API is running', port: PORT });
+    });
+    
+    // ========== PROTECTED ROUTES (Authentication required) ==========
+    // All routes below this line require a valid JWT token
+    
+    // Apply authentication middleware to all protected routes
+    app.use(authenticateToken);
+    
     // ========== CUSTOMER ROUTES ==========
-    app.get('/api/customers', async (req, res) => {
+    app.get('/api/customers', requireAdmin, async (req, res) => {
       const customers = await customersCollection.find({}).toArray();
       res.json(customers);
     });
     
     app.get('/api/customers/:id', async (req, res) => {
       const id = parseInt(req.params.id);
+      // Users can only view their own profile unless admin
+      if (req.user.role !== 'admin' && req.user.id !== id) {
+        return res.status(403).json({ error: 'Access denied' });
+      }
       const customer = await customersCollection.findOne({ id: id });
       if (customer) {
         res.json(customer);
@@ -332,19 +345,25 @@ async function startServer() {
     
     app.put('/api/customers/:id', async (req, res) => {
       const id = parseInt(req.params.id);
+      if (req.user.role !== 'admin' && req.user.id !== id) {
+        return res.status(403).json({ error: 'Access denied' });
+      }
       await customersCollection.updateOne({ id: id }, { $set: req.body });
       const updated = await customersCollection.findOne({ id: id });
       res.json({ success: true, customer: updated });
     });
     
     // ========== ENGINEER ROUTES ==========
-    app.get('/api/engineers', async (req, res) => {
+    app.get('/api/engineers', requireAdmin, async (req, res) => {
       const engineers = await engineersCollection.find({}).toArray();
       res.json(engineers);
     });
     
     app.get('/api/engineers/:id', async (req, res) => {
       const id = parseInt(req.params.id);
+      if (req.user.role !== 'admin' && req.user.id !== id) {
+        return res.status(403).json({ error: 'Access denied' });
+      }
       const engineer = await engineersCollection.findOne({ id: id });
       if (engineer) {
         res.json(engineer);
@@ -374,19 +393,25 @@ async function startServer() {
     });
     
     // ========== BOOKING ROUTES ==========
-    app.get('/api/bookings', async (req, res) => {
+    app.get('/api/bookings', requireAdmin, async (req, res) => {
       const bookings = await bookingsCollection.find({}).toArray();
       res.json(bookings);
     });
     
     app.get('/api/bookings/customer/:customerId', async (req, res) => {
       const customerId = parseInt(req.params.customerId);
+      if (req.user.role !== 'admin' && req.user.id !== customerId) {
+        return res.status(403).json({ error: 'Access denied' });
+      }
       const bookings = await bookingsCollection.find({ customerId: customerId }).toArray();
       res.json(bookings);
     });
     
     app.get('/api/bookings/engineer/:engineerId', async (req, res) => {
       const engineerId = parseInt(req.params.engineerId);
+      if (req.user.role !== 'admin' && req.user.id !== engineerId) {
+        return res.status(403).json({ error: 'Access denied' });
+      }
       const bookings = await bookingsCollection.find({ engineerId: engineerId }).toArray();
       res.json(bookings);
     });
@@ -394,6 +419,11 @@ async function startServer() {
     app.post('/api/bookings', async (req, res) => {
       if (!req.body.customerId || !req.body.device || !req.body.address) {
         return res.status(400).json({ error: 'Missing required fields' });
+      }
+      
+      // Ensure customer can only create bookings for themselves
+      if (req.user.role !== 'admin' && req.body.customerId !== req.user.id) {
+        return res.status(403).json({ error: 'Cannot create booking for another user' });
       }
       
       const sanitize = (str) => {
@@ -440,6 +470,7 @@ async function startServer() {
         return res.status(404).json({ error: 'Booking not found' });
       }
       
+      // Check authorization
       if (req.user.role !== 'admin' && 
           req.user.role !== 'engineer' && 
           booking.customerId !== req.user.id) {
@@ -516,6 +547,10 @@ async function startServer() {
         return res.status(404).json({ error: 'Booking not found' });
       }
       
+      if (booking.customerId !== req.user.id) {
+        return res.status(403).json({ error: 'Not authorized' });
+      }
+      
       if (booking.status !== 'negotiating') {
         return res.status(400).json({ error: `Cannot accept price. Current status: ${booking.status}` });
       }
@@ -535,6 +570,10 @@ async function startServer() {
       
       if (!booking) {
         return res.status(404).json({ error: 'Booking not found' });
+      }
+      
+      if (booking.customerId !== req.user.id) {
+        return res.status(403).json({ error: 'Not authorized' });
       }
       
       if (booking.status !== 'negotiating') {
@@ -561,11 +600,13 @@ async function startServer() {
       res.json({ success: true, booking: await bookingsCollection.findOne({ id: id }) });
     });
     
-    app.get('/api/payments', async (req, res) => {
+    // ========== PAYMENT ROUTES ==========
+    app.get('/api/payments', requireAdmin, async (req, res) => {
       const payments = await paymentsCollection.find({}).toArray();
       res.json(payments);
     });
     
+    // ========== STATS ROUTES ==========
     app.get('/api/stats', requireAdmin, async (req, res) => {
       const customersCount = await customersCollection.countDocuments();
       const engineersCount = await engineersCollection.countDocuments();
@@ -589,16 +630,32 @@ async function startServer() {
     // ========== CHAT ROUTES ==========
     app.get('/api/chats/:bookingId', async (req, res) => {
       const bookingId = req.params.bookingId;
-      const userId = parseInt(req.query.userId);
-      const userRole = req.query.role;
+      const booking = await bookingsCollection.findOne({ id: bookingId });
+      
+      if (!booking) {
+        return res.status(404).json({ error: 'Booking not found' });
+      }
+      
+      // Check if user is involved in this chat
+      if (req.user.role !== 'admin' && 
+          booking.customerId !== req.user.id && 
+          booking.engineerId !== req.user.id) {
+        return res.status(403).json({ error: 'Not authorized to view this chat' });
+      }
       
       const chats = await chatsCollection.find({ bookingId: bookingId }).toArray();
       
-      const unreadCount = chats.filter(chat => 
-        chat.sender !== userRole && !chat.read
-      ).length;
+      // Mark messages as read
+      await chatsCollection.updateMany(
+        { 
+          bookingId: bookingId, 
+          sender: { $ne: req.user.role },
+          read: false 
+        },
+        { $set: { read: true, readAt: new Date().toISOString() } }
+      );
       
-      res.json({ messages: chats, unreadCount: unreadCount });
+      res.json(chats);
     });
     
     app.post('/api/chats', async (req, res) => {
@@ -606,11 +663,23 @@ async function startServer() {
         return res.status(400).json({ error: 'Booking ID and message required' });
       }
       
+      const booking = await bookingsCollection.findOne({ id: req.body.bookingId });
+      if (!booking) {
+        return res.status(404).json({ error: 'Booking not found' });
+      }
+      
+      // Verify user is part of this conversation
+      if (req.user.role !== 'admin' && 
+          booking.customerId !== req.user.id && 
+          booking.engineerId !== req.user.id) {
+        return res.status(403).json({ error: 'Not authorized to send message' });
+      }
+      
       const newMessage = {
         id: Date.now(),
         bookingId: req.body.bookingId,
-        sender: req.body.sender,
-        senderName: req.body.senderName,
+        sender: req.user.role,
+        senderName: req.body.senderName || req.user.name,
         message: req.body.message,
         timestamp: req.body.timestamp || Date.now(),
         read: false
@@ -620,25 +689,13 @@ async function startServer() {
       res.json({ success: true, message: newMessage });
     });
     
-    app.put('/api/chats/:bookingId/read', async (req, res) => {
-      const bookingId = req.params.bookingId;
-      const { userId, role } = req.body;
-      
-      await chatsCollection.updateMany(
-        { 
-          bookingId: bookingId, 
-          sender: { $ne: role },
-          read: false 
-        },
-        { $set: { read: true, readAt: new Date().toISOString() } }
-      );
-      
-      res.json({ success: true });
-    });
-    
     app.get('/api/chats/unread/:userId/:role', async (req, res) => {
       const userId = parseInt(req.params.userId);
       const role = req.params.role;
+      
+      if (req.user.id !== userId) {
+        return res.status(403).json({ error: 'Access denied' });
+      }
       
       let bookings;
       if (role === 'customer') {
@@ -667,12 +724,18 @@ async function startServer() {
     // ========== NOTIFICATION ROUTES ==========
     app.get('/api/notifications/:userId', async (req, res) => {
       const userId = parseInt(req.params.userId);
+      if (req.user.id !== userId && req.user.role !== 'admin') {
+        return res.status(403).json({ error: 'Access denied' });
+      }
       const notifications = await notificationsCollection.find({ userId: userId, deleted: false }).toArray();
       res.json(notifications);
     });
     
     app.get('/api/notifications/:userId/unread', async (req, res) => {
       const userId = parseInt(req.params.userId);
+      if (req.user.id !== userId && req.user.role !== 'admin') {
+        return res.status(403).json({ error: 'Access denied' });
+      }
       const count = await notificationsCollection.countDocuments({ userId: userId, read: false, deleted: false });
       res.json({ count: count });
     });
@@ -684,19 +747,19 @@ async function startServer() {
     });
     
     // ========== DISPATCH ROUTES ==========
-    app.get('/api/dispatch/jobs', async (req, res) => {
+    app.get('/api/dispatch/jobs', requireAdmin, async (req, res) => {
       const dispatchJobs = await bookingsCollection.find({
         status: { $in: ['negotiating', 'dispatch_assigned', 'with_engineer', 'inrepair', 'dispatch_return'] }
       }).toArray();
       res.json(dispatchJobs);
     });
     
-    app.get('/api/dispatch/riders', async (req, res) => {
+    app.get('/api/dispatch/riders', requireAdmin, async (req, res) => {
       const riders = await dispatchRidersCollection.find({}).toArray();
       res.json(riders);
     });
     
-    app.post('/api/dispatch/riders', async (req, res) => {
+    app.post('/api/dispatch/riders', requireAdmin, async (req, res) => {
       const newRider = {
         id: Date.now(),
         ...req.body,
@@ -705,11 +768,6 @@ async function startServer() {
       };
       await dispatchRidersCollection.insertOne(newRider);
       res.json({ success: true, rider: newRider });
-    });
-    
-    // ========== HEALTH CHECK ROUTE ==========
-    app.get('/health', (req, res) => {
-      res.json({ status: 'OK', message: 'Xpressfixing API is running', port: PORT });
     });
     
     // ========== ERROR HANDLER ==========
@@ -721,13 +779,14 @@ async function startServer() {
       });
     });
     
-    // ========== START SERVER (ONLY ONCE!) ==========
+    // ========== START SERVER ==========
     app.listen(PORT, () => {
       console.log(`\n╔═══════════════════════════════════════════════════╗`);
       console.log(`║     🚀 XPRESSFIXING BACKEND SERVER RUNNING       ║`);
       console.log(`╚═══════════════════════════════════════════════════╝`);
       console.log(`\n📍 Port: ${PORT}`);
       console.log(`🗄️  Database: ${MONGODB_URI.includes('localhost') ? 'Local MongoDB' : 'MongoDB Atlas'}`);
+      console.log(`🔐 JWT Authentication: ENABLED`);
       console.log(`\n🔑 Demo Accounts:`);
       console.log(`   👑 Admin:    admin@xpressfixing.com / demo123`);
       console.log(`   👤 Customer: customer@xpressfixing.com / demo123`);
