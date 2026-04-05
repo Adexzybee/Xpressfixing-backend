@@ -320,6 +320,29 @@ async function startServer() {
     // ========== PROTECTED ROUTES (Authentication required) ==========
     // All routes below this line require a valid JWT token
     
+    // Public endpoint for engineer reviews (no authentication needed)
+app.get('/api/public/engineer/:engineerId/reviews', async (req, res) => {
+  try {
+    const engineerId = parseInt(req.params.engineerId);
+    const bookings = await bookingsCollection.find({ 
+      engineerId: engineerId, 
+      status: 'completed',
+      customerRating: { $exists: true, $ne: null }
+    }).toArray();
+    
+    const reviews = bookings.map(b => ({
+      customerName: b.customerName,
+      rating: b.customerRating,
+      review: b.customerReview || 'No written review',
+      date: b.createdAt
+    }));
+    
+    res.json(reviews);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
     // Apply authentication middleware to all protected routes
     app.use(authenticateToken);
     
@@ -369,18 +392,19 @@ async function startServer() {
   res.json(engineers);
 });
     
-    app.get('/api/engineers/:id', async (req, res) => {
-      const id = parseInt(req.params.id);
-      if (req.user.role !== 'admin' && req.user.id !== id) {
-        return res.status(403).json({ error: 'Access denied' });
-      }
-      const engineer = await engineersCollection.findOne({ id: id });
-      if (engineer) {
-        res.json(engineer);
-      } else {
-        res.status(404).json({ error: 'Engineer not found' });
-      }
-    });
+ app.get('/api/engineers/:id', async (req, res) => {
+  const id = parseInt(req.params.id);
+  // Allow customers to view engineer profiles (for reviews)
+  if (req.user.role !== 'admin' && req.user.role !== 'customer' && req.user.id !== id) {
+    return res.status(403).json({ error: 'Access denied' });
+  }
+  const engineer = await engineersCollection.findOne({ id: id });
+  if (engineer) {
+    res.json(engineer);
+  } else {
+    res.status(404).json({ error: 'Engineer not found' });
+  }
+});
     
     app.put('/api/engineers/:id', requireAdmin, async (req, res) => {
       const id = parseInt(req.params.id);
