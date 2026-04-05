@@ -354,10 +354,20 @@ async function startServer() {
     });
     
     // ========== ENGINEER ROUTES ==========
-    app.get('/api/engineers', requireAdmin, async (req, res) => {
-      const engineers = await engineersCollection.find({}).toArray();
-      res.json(engineers);
-    });
+  app.get('/api/engineers', authenticateToken, async (req, res) => {
+  // Allow both admin and customers to view engineers
+  let engineers;
+  
+  if (req.user.role === 'admin') {
+    // Admin sees all engineers
+    engineers = await engineersCollection.find({}).toArray();
+  } else {
+    // Customers only see active engineers
+    engineers = await engineersCollection.find({ status: 'active' }).toArray();
+  }
+  
+  res.json(engineers);
+});
     
     app.get('/api/engineers/:id', async (req, res) => {
       const id = parseInt(req.params.id);
